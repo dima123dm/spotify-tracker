@@ -23,20 +23,22 @@ if not SP_DC_COOKIE or not PLAYLIST_ID:
 # ====================================================
 
 def get_token_from_cookie(sp_dc):
-    # ! ИСПРАВЛЕНО: Теперь тут настоящая ссылка Spotify API
+    # !!! ИСПРАВЛЕНИЕ: Прямая ссылка на Spotify (без прокси)
     url = "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
+    
     headers = {
         "Cookie": f"sp_dc={sp_dc}",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Origin": "https://open.spotify.com",
+        "Referer": "https://open.spotify.com/",
+        "Accept": "application/json"
     }
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
-        # В ответе приходит JSON, где токен лежит в поле "accessToken"
         return response.json()["accessToken"]
     except Exception as e:
         print(f"Ошибка получения токена: {e}")
-        # Если ошибка — выводим ответ сервера, чтобы понять причину
         try:
             print(f"Ответ сервера: {response.text}")
         except:
@@ -72,15 +74,18 @@ def check_new_releases():
     latest_release_date = last_date
     
     try:
+        # Получаем подписки
         results = sp.current_user_followed_artists(limit=50)
         artists = results['artists']['items']
         
         for artist in artists:
-            # country="UA" — важно для доступности треков
+            # country="UA" - важно для доступности в Украине
             albums = sp.artist_albums(artist['id'], limit=5, country="UA")
             
             for album in albums['items']:
                 release_date = album['release_date']
+                
+                # Сравниваем даты
                 if release_date > last_date:
                     print(f"Найдено новое: {artist['name']} - {album['name']} ({release_date})")
                     tracks = sp.album_tracks(album['id'])
@@ -92,7 +97,7 @@ def check_new_releases():
 
         if new_tracks_uris:
             unique_uris = list(set(new_tracks_uris))
-            # Разбиваем на пачки по 100 треков
+            # Разбиваем на пачки по 100 треков (ограничение API)
             for i in range(0, len(unique_uris), 100):
                 sp.playlist_add_items(PLAYLIST_ID, unique_uris[i:i+100])
             
@@ -108,7 +113,6 @@ def check_new_releases():
 if __name__ == "__main__":
     print("Бот запущен. Первая проверка...")
     
-    # Запускаем проверку сразу при старте
     check_new_releases()
 
     schedule.every().day.at("09:00").do(check_new_releases)

@@ -102,7 +102,7 @@ if __name__ == "__main__":
     print("Бот запущен. Ожидаю расписания...")
     
     # Можно раскомментировать для теста при запуске:
-    # check_new_releases()
+    check_new_releases()
 
     schedule.every().day.at("09:00").do(check_new_releases)
     schedule.every().day.at("21:00").do(check_new_releases)

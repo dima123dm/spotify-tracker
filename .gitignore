@@ -1,4 +1,5 @@
 .env
-bot_data.json
+bot_state.json
+.cache
 __pycache__/
 *.pyc

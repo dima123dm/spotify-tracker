@@ -47,7 +47,8 @@ def load_state():
         "last_processed_index": 0,
         "last_checked_date": "2000-01-01",
         "last_run_timestamp": 0,
-        "artists_processed": {}  # {artist_id: last_release_date}
+        "artists_processed": {},  # {artist_id: last_release_date}
+        "monitoring_index": 0  # для продолжения мониторинга
     }
 
 def save_state(state):
@@ -72,7 +73,7 @@ def handle_rate_limit(e):
     """Обрабатывает ошибку rate limit от Spotify"""
     if hasattr(e, 'http_status') and e.http_status == 429:
         retry_after = int(e.headers.get('Retry-After', 60)) + 5
-        print(f"\n⚠️ ЛИМИТ! Spotify просит подождать {retry_after} сек.")
+        print(f"\n⚠️ ЛИМИТ 429! Spotify просит подождать {retry_after} сек.")
         print("   💤 Сплю (не выключай меня)...")
         time.sleep(retry_after)
         return True
@@ -81,12 +82,6 @@ def handle_rate_limit(e):
 def get_artist_releases(sp, artist_id, limit_per_type=20):
     """
     Получает релизы артиста (альбомы и синглы).
-    
-    ИСПРАВЛЕНО:
-    - Используем include_groups вместо album_type
-    - limit=10 (максимум для artist_albums API)
-    - Отдельные запросы для 'album' и 'single'
-    - Пагинация для получения нужного количества релизов
     """
     all_releases = []
     
@@ -96,12 +91,11 @@ def get_artist_releases(sp, artist_id, limit_per_type=20):
         
         while len(type_releases) < limit_per_type:
             try:
-                # КРИТИЧНО: limit максимум 10 для artist_albums!
                 results = sp.artist_albums(
                     artist_id,
-                    include_groups=release_type,  # ← ПРАВИЛЬНЫЙ ПАРАМЕТР!
+                    include_groups=release_type,
                     country="UA",
-                    limit=10,  # ← МАКСИМУМ 10!
+                    limit=10,
                     offset=offset
                 )
                 
@@ -111,7 +105,6 @@ def get_artist_releases(sp, artist_id, limit_per_type=20):
                 
                 type_releases.extend(items)
                 
-                # Если больше нет страниц
                 if results.get('next') is None:
                     break
                 
@@ -134,13 +127,11 @@ def get_latest_track_smart(sp, artist_id):
     Возвращает: (track_uri, release_date) или (None, None)
     """
     try:
-        # Получаем последние релизы
         releases = get_artist_releases(sp, artist_id, limit_per_type=10)
         
         if not releases:
             return None, None
         
-        # Сортируем по дате (самые свежие первыми)
         sorted_releases = sorted(
             releases, 
             key=lambda x: x.get('release_date', '0000-00-00'), 
@@ -150,7 +141,6 @@ def get_latest_track_smart(sp, artist_id):
         latest = sorted_releases[0]
         release_date = latest.get('release_date', '0000-00-00')
         
-        # Получаем ТОЛЬКО ПЕРВЫЙ трек из релиза
         tracks = sp.album_tracks(latest['id'], limit=1)
         
         if tracks['items']:
@@ -171,14 +161,13 @@ def run_daily_safe_scan():
     
     1. ПЕРВЫЙ ЗАПУСК (initial_scan_done=false):
        - Добавляет ПО 1 ТРЕКУ из последнего релиза каждого артиста
-       - Это "база" от которой отталкиваться
-       - Если влетит в лимит - продолжит на следующий день
+       - СОХРАНЯЕТ ПРОГРЕСС после каждого артиста
+       - Если влетит в лимит 429 - ждет сколько скажет Spotify и продолжает
     
     2. МОНИТОРИНГ (initial_scan_done=true):
        - Проверяет ОДИН РАЗ В СУТКИ всех артистов
-       - Если находит новый релиз (альбом/сингл/EP) - добавляет ВСЕ треки
-       - Да, если в альбоме 30 треков - добавит все 30!
-       - Если влетит в лимит - продолжит завтра с того места
+       - СРАЗУ добавляет треки при находке нового релиза
+       - Если влетит в лимит 429 - ждет и продолжает с того же места
     """
     state = load_state()
     
@@ -186,10 +175,15 @@ def run_daily_safe_scan():
     # ЖЕСТКИЙ ЛИМИТ: ОДИН РАЗ В 24 ЧАСА
     # ═══════════════════════════════════════════════════════
     last_run = datetime.fromtimestamp(state.get("last_run_timestamp", 0))
-    if last_run.date() == datetime.now().date() and state["initial_scan_done"]:
-        print(f"[{datetime.now().strftime('%H:%M')}] ✋ Лимит на сегодня исчерпан (бот уже работал сегодня).")
-        print(f"   ⏰ Следующий запуск в {RUN_TIME}")
-        return
+    current_date = datetime.now().date()
+    
+    # Проверка: если уже работали сегодня И первичное сканирование завершено
+    if last_run.date() == current_date and state["initial_scan_done"]:
+        # НО! Если мониторинг не завершен (monitoring_index > 0), разрешаем продолжить
+        if state.get("monitoring_index", 0) == 0:
+            print(f"[{datetime.now().strftime('%H:%M')}] ✋ Лимит на сегодня исчерпан (бот уже работал сегодня).")
+            print(f"   ⏰ Следующий запуск в {RUN_TIME}")
+            return
     
     sp = get_spotify_client()
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🚀 Запуск сканирования...")
@@ -209,7 +203,6 @@ def run_daily_safe_scan():
         
         print(f"   ✅ Подписок: {len(artists)}")
         
-        requests_count = 0
         limit_reached = False
 
         # ═══════════════════════════════════════════════════════
@@ -221,22 +214,15 @@ def run_daily_safe_scan():
             latest_global_date = state["last_checked_date"]
             
             for i in range(start_index, len(artists)):
-                # Защита от превышения лимитов
-                if requests_count >= 95:
-                    print(f"\n   🛑 Дневной лимит (95 запросов) достигнут.")
-                    print(f"   💾 Сохраняю прогресс: {i}/{len(artists)} артистов обработано")
-                    limit_reached = True
-                    break
-
                 artist = artists[i]
                 print(f"   [{i+1}/{len(artists)}] {artist['name'][:30]}...", end=" ")
                 
                 try:
                     # Получаем 1 трек из последнего релиза
                     track_uri, release_date = get_latest_track_smart(sp, artist['id'])
-                    requests_count += 4  # ~4 запроса на артиста
                     
                     if track_uri and release_date:
+                        # СРАЗУ добавляем трек в плейлист
                         add_tracks_direct(sp, [track_uri])
                         state["artists_processed"][artist['id']] = release_date
                         
@@ -247,6 +233,7 @@ def run_daily_safe_scan():
                     else:
                         print("⚠️ нет релизов")
                     
+                    # СОХРАНЯЕМ ПРОГРЕСС после каждого артиста
                     state["last_processed_index"] = i + 1
                     state["last_checked_date"] = latest_global_date
                     save_state(state)
@@ -255,37 +242,42 @@ def run_daily_safe_scan():
                     
                 except Exception as e:
                     if handle_rate_limit(e):
-                        limit_reached = True
-                        break
+                        # После ожидания - просто продолжаем (не прерываемся)
+                        # Повторяем этого же артиста
+                        i -= 1
+                        continue
                     print(f"❌ {e}")
 
-            if not limit_reached:
-                # Первичное сканирование ПОЛНОСТЬЮ завершено
-                print(f"\n   ✅ База собрана! Завтра начнем искать новинки.")
-                state["initial_scan_done"] = True
-                state["last_processed_index"] = 0
-                state["last_run_timestamp"] = datetime.now().timestamp()
-                save_state(state)
-            else:
-                # Влетели в лимит - продолжим завтра
-                state["last_run_timestamp"] = datetime.now().timestamp()
-                save_state(state)
+            # Первичное сканирование ПОЛНОСТЬЮ завершено
+            print(f"\n   ✅ База собрана! Завтра начнем искать новинки.")
+            state["initial_scan_done"] = True
+            state["last_processed_index"] = 0
+            state["last_run_timestamp"] = datetime.now().timestamp()
+            save_state(state)
 
         # ═══════════════════════════════════════════════════════
         # РЕЖИМ 2: МОНИТОРИНГ НОВИНОК (ВСЕ ТРЕКИ ИЗ НОВЫХ РЕЛИЗОВ)
         # ═══════════════════════════════════════════════════════
         else:
-            print(f"\n   📢 МОНИТОРИНГ: Ищу новинки (свежее {state['last_checked_date']})...")
+            # Проверяем, это новый день или продолжение сегодняшнего
+            start_monitoring_index = 0
+            if last_run.date() == current_date:
+                # Продолжаем с того места, где остановились
+                start_monitoring_index = state.get("monitoring_index", 0)
+                if start_monitoring_index > 0:
+                    print(f"\n   🔄 ПРОДОЛЖАЮ мониторинг с артиста #{start_monitoring_index+1}")
+            else:
+                # Новый день - начинаем сначала
+                state["monitoring_index"] = 0
+                start_monitoring_index = 0
+                print(f"\n   📢 МОНИТОРИНГ: Ищу новинки (свежее {state['last_checked_date']})...")
+            
             last_global_date = state["last_checked_date"]
             new_max_date = last_global_date
-            new_tracks = []
             
-            for i, artist in enumerate(artists):
-                # Защита от превышения лимитов
-                if requests_count >= 95:
-                    print(f"\n   ⚠️ Лимит 95 запросов. Останавливаю до завтра.")
-                    break
-
+            i = start_monitoring_index
+            while i < len(artists):
+                artist = artists[i]
                 artist_id = artist['id']
                 artist_last_date = state["artists_processed"].get(artist_id, "2000-01-01")
                 
@@ -294,7 +286,6 @@ def run_daily_safe_scan():
                 try:
                     # Получаем релизы артиста
                     releases = get_artist_releases(sp, artist_id, limit_per_type=5)
-                    requests_count += 2  # 2 запроса (album + single)
                     
                     found_new = False
                     for release in releases:
@@ -307,13 +298,13 @@ def run_daily_safe_scan():
                             
                             # Получаем ВСЕ ТРЕКИ из нового релиза
                             tracks = sp.album_tracks(release['id'], limit=50)
-                            requests_count += 1
                             
-                            track_count = len(tracks['items'])
-                            print(f"         ➕ Добавляю {track_count} треков из релиза")
+                            track_uris = [t['uri'] for t in tracks['items']]
+                            track_count = len(track_uris)
+                            print(f"         ➕ Добавляю {track_count} треков...")
                             
-                            for t in tracks['items']:
-                                new_tracks.append(t['uri'])
+                            # СРАЗУ добавляем в плейлист!
+                            add_tracks_direct(sp, track_uris)
                             
                             found_new = True
                             
@@ -324,31 +315,33 @@ def run_daily_safe_scan():
                             # Обновляем глобальную максимальную дату
                             if release_date > new_max_date:
                                 new_max_date = release_date
+                            
+                            # СОХРАНЯЕМ после каждой находки
+                            state["last_checked_date"] = new_max_date
+                            save_state(state)
                     
                     if not found_new:
                         print("—")
                     
                     time.sleep(SAFE_DELAY)
+                    i += 1
                     
                 except Exception as e:
                     if handle_rate_limit(e):
-                        break
+                        # После ожидания - сохраняем прогресс и продолжаем с ТОГО ЖЕ артиста
+                        state["monitoring_index"] = i
+                        state["last_checked_date"] = new_max_date
+                        save_state(state)
+                        # НЕ увеличиваем i - повторим этого же артиста
+                        continue
                     print(f"❌ {e}")
+                    i += 1
 
-            # Итоги
-            print(f"\n   📊 ИТОГО:")
-            print(f"   • Запросов использовано: {requests_count}")
-            print(f"   • Новых треков найдено: {len(new_tracks)}")
+            # Мониторинг ПОЛНОСТЬЮ завершен
+            print(f"\n   ✅ Мониторинг завершен!")
             
-            if new_tracks:
-                unique_tracks = list(set(new_tracks))
-                print(f"   ⬆️ Добавляю {len(unique_tracks)} уникальных треков в плейлист...")
-                add_tracks_direct(sp, unique_tracks)
-                state["last_checked_date"] = new_max_date
-            else:
-                print(f"   💤 Новинок нет")
-            
-            # Записываем метку времени (работа на сегодня выполнена)
+            # Сбрасываем индекс мониторинга (на следующий день начнем сначала)
+            state["monitoring_index"] = 0
             state["last_run_timestamp"] = datetime.now().timestamp()
             save_state(state)
 
@@ -368,14 +361,15 @@ if __name__ == "__main__":
     print(f"{'═'*60}")
     print(f"1️⃣  ПЕРВЫЙ ЗАПУСК:")
     print(f"   • Добавляет ПО 1 ТРЕКУ из последнего релиза каждого артиста")
-    print(f"   • Создает 'базу' для отслеживания новинок")
-    print(f"   • Если влетит в лимит - продолжит завтра")
+    print(f"   • СРАЗУ добавляет трек в плейлист (не ждет конца)")
+    print(f"   • Сохраняет прогресс после каждого артиста")
+    print(f"   • Если Spotify даст 429 - ждет и продолжает (не останавливается)")
     print(f"")
     print(f"2️⃣  ЕЖЕДНЕВНЫЙ МОНИТОРИНГ:")
     print(f"   • Проверяет ОДИН РАЗ В СУТКИ всех артистов")
-    print(f"   • Если находит новый релиз - добавляет ВСЕ треки")
-    print(f"   • Да, если альбом на 30 треков - добавит все 30!")
-    print(f"   • Если влетит в лимит - продолжит на следующий день")
+    print(f"   • Если находит новый релиз - СРАЗУ добавляет ВСЕ треки")
+    print(f"   • Если Spotify даст 429 - ждет и продолжает (не останавливается)")
+    print(f"   • Сохраняет прогресс после каждой находки")
     print(f"")
     print(f"⚠️  ЖЕСТКИЙ ЛИМИТ: Один запуск в 24 часа (защита от Spotify)")
     print(f"{'═'*60}\n")
